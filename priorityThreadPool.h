@@ -6,6 +6,8 @@
 #include <memory>
 #include <atomic>
 #include <iostream>
+#include <ctime>
+#include "timeouttable.h"
 namespace ptpl {
 	using namespace std;
 	//线程安全的任务队列
@@ -115,7 +117,7 @@ namespace ptpl {
 	//线程池
 	
 	class FCFS_ThreadPool {
-	private:
+	protected:
 		//禁用拷贝构造函数
 		FCFS_ThreadPool& operator=(const FCFS_ThreadPool&);
 		FCFS_ThreadPool& operator=(const FCFS_ThreadPool&&);
@@ -455,7 +457,103 @@ namespace ptpl {
 			return pck;
 		}
 	};
+	class AutoSuitPool :public FCFS_ThreadPool {
+	private:
+		queue<int>outThread;//已经退出的线程id
+		mutex outlock;
+		tot::TimeOutTable totable;//等待中的线程表
+
+		thread* Threadmaster;
+		
+		//线程释放机制
+		void startThread(int i) {
+			shared_ptr<atomic<bool>>stop_sign_copy(this->stopsign[i]);
+			//创建线程任务
+			auto threadtask = [this, i, stop_sign_copy]() {
+				atomic<bool>& _sign = *stop_sign_copy;
+				function<void(void)>* _func;
+				bool tasknoempty = this->tasks.pop(_func);
+				while (true) {
+					//取任务成功，执行任务
+					while (tasknoempty) {
+						(*_func)();
+						//检查停止信号
+						if (_sign)return;
+						else tasknoempty = this->tasks.pop(_func);
+					}
+					//将线程加入到等待表
+					totable.push(i);
+					//空闲线程+1
+					unique_lock<mutex>lck(this->mx);
+					++this->idleThreadNum;
+					this->cv.wait(lck, [this, &_func, &_sign, &tasknoempty]() {
+						tasknoempty = this->tasks.pop(_func);
+						return tasknoempty || this->isDone || _sign;
+						});
+					totable.remove(i);
+					--this->idleThreadNum;
+					//已无任务执行，结束线程任务
+					if (!tasknoempty) {
+						return;
+					}
+				}
+			};
+			//线程任务交付线程执行
+			this->threadpool[i].reset(new thread(threadtask));
+		}
+		//超时监控线程
+		void startThreadMaster() {
+			this->Threadmaster = new thread([this]() {
+				long long t;
+				while (true) {
+					Sleep(5000);
+					time(&t);
+					int i;
+					if(!this->totable.empty())
+					while (t - this->totable.GetTopTime() > 5000) {
+						i = this->totable.pop();
+						(*(this->threadpool[i])).~thread();
+						//加入到退出线程队列
+						this->outThread.push(i);
+						time(&t);
+					}
+				}
+			});
+		}
+	public:
+		//启动监控线程
+		AutoSuitPool():FCFS_ThreadPool() {
+			startThreadMaster();
+		}
+		//线程重启机制
+		template <typename F, typename... PARAM>
+		auto push(F&& f, PARAM&&... params) {
+			auto pck = tasks.push(forward<F>(f), forward<PARAM>(params)...);
+			{
+				if (GetidleThreadNumber() == 0) {
+					unique_lock<mutex> lck(outlock);
+					if (outThread.empty()) {
+						int ms = threadpool.size();
+						if (ms < 100)
+							resize(max(ms + 5, (int)(1.2 * ms)));
+					}
+					else {
+						startThread(outThread.front());
+						outThread.pop();
+					}
+				}
+				else {
+					//激活一个等待中的线程
+					unique_lock<mutex>lck(mx);
+					cv.notify_one();
+					return pck;
+				}
+			}
+		}
+	};
 }
+
+
 
 
 
