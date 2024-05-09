@@ -18,7 +18,6 @@ namespace tot {
 		std::mutex mx;
 	public:
 		bool empty() {
-			unique_lock<mutex>lck(mx);
 			return timeoutque.empty();
 		}
 		void push(int id) {
@@ -30,8 +29,9 @@ namespace tot {
 		}
 		//t赋值为最早的时间戳，返回该等待线程id
 		int pop() {
-			unique_lock<mutex>lck(mx);
-			auto temp = timeoutque.back();
+			//unique_lock<mutex>lck(mx);
+			if (timeoutque.empty())return -1;
+			auto& temp = timeoutque.back();
 			timeoutque.pop_back();
 			addr.erase(temp.id);
 			return temp.id;
@@ -44,8 +44,15 @@ namespace tot {
 			}
 		}
 		long long GetTopTime() {
-			unique_lock<mutex>lck(mx);
+			//unique_lock<mutex>lck(mx);
 			return timeoutque.back().outtime;
+		}
+		//锁定队列
+		void lockque() {
+			mx.lock();
+		}
+		void unlockque() {
+			mx.unlock();
 		}
 	};
 

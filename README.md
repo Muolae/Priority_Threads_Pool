@@ -1,6 +1,12 @@
-# Priority_Threads_Pool
 
 支持优先级调度SPF和先来先服务FCFS的线程池，基于开源项目ctpl (https://github.com/vit-vit/CTPL)拓展
+#更新日志
+2024年
+
+5月8日：
+完成了自适应线程池的实现;支持设置线程池初始大小和最大大小以及释放线程的最长时间。
+5月9日：
+修复了调用任务empty()后互斥锁提前释放导致任务队列访问出错的问题。
 
 #文件说明
 PriorityThreadsPool文件夹：vs2019工程项目

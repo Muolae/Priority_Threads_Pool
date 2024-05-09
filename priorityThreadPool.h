@@ -25,10 +25,9 @@ namespace ptpl {
 			return taskque.empty();
 		}
 		bool pop(function<void(void)>*& t) {
-			
+			unique_lock<mutex>lck(this->x);
 			if (taskque.empty())return false;
 			else {
-				unique_lock<mutex>lck(this->x);
 				t = taskque.front();
 				taskque.pop();
 				return true;
@@ -457,6 +456,7 @@ namespace ptpl {
 			return pck;
 		}
 	};
+	//支持自适应线程大小的线程池
 	class AutoSuitPool :public FCFS_ThreadPool {
 	private:
 		queue<int>outThread;//已经退出的线程id
@@ -464,8 +464,14 @@ namespace ptpl {
 		tot::TimeOutTable totable;//等待中的线程表
 
 		thread* Threadmaster;
-		
+		//最大线程数量
+		int maxthreadnum = 100;
+		//超时时间
+		int maxwaittime = 5000;
+
 		//线程释放机制
+		
+		//启动线程
 		void startThread(int i) {
 			shared_ptr<atomic<bool>>stop_sign_copy(this->stopsign[i]);
 			//创建线程任务
@@ -499,6 +505,8 @@ namespace ptpl {
 				}
 			};
 			//线程任务交付线程执行
+			//释放之前的线程
+			this->threadpool[i]->detach();
 			this->threadpool[i].reset(new thread(threadtask));
 		}
 		//超时监控线程
@@ -506,23 +514,43 @@ namespace ptpl {
 			this->Threadmaster = new thread([this]() {
 				long long t;
 				while (true) {
-					Sleep(5000);
+					Sleep(this->maxwaittime);
 					time(&t);
 					int i;
-					if(!this->totable.empty())
-					while (t - this->totable.GetTopTime() > 5000) {
-						i = this->totable.pop();
-						(*(this->threadpool[i])).~thread();
-						//加入到退出线程队列
-						this->outThread.push(i);
-						time(&t);
+					this->totable.lockque();
+					if (!this->totable.empty()) {
+						
+						while (t - this->totable.GetTopTime() > this->maxwaittime) {
+							i = this->totable.pop();
+							if (i < 0)break;
+							//终止线程
+							//(*(this->threadpool[i])).~thread();
+							*(this->stopsign[i]) = true;
+							{
+								unique_lock<mutex>lck(this->mx);
+								this->cv.notify_all();
+							}
+							//加入到退出线程队列
+							{
+								unique_lock<mutex> lck(this->outlock);
+								this->outThread.push(i);
+							}						
+							time(&t);
+						}
+						
 					}
+					this->totable.unlockque();
 				}
 			});
 		}
 	public:
 		//启动监控线程
-		AutoSuitPool():FCFS_ThreadPool() {
+		AutoSuitPool():FCFS_ThreadPool(5) {
+			startThreadMaster();
+		}
+		AutoSuitPool(int maxThreadNum,int FirstThreadNum,int overTime) :FCFS_ThreadPool(FirstThreadNum) {
+			this->maxthreadnum = maxThreadNum;
+			this->maxwaittime = overTime;
 			startThreadMaster();
 		}
 		//线程重启机制
@@ -534,8 +562,9 @@ namespace ptpl {
 					unique_lock<mutex> lck(outlock);
 					if (outThread.empty()) {
 						int ms = threadpool.size();
-						if (ms < 100)
-							resize(max(ms + 5, (int)(1.2 * ms)));
+						ms = max(ms + 1, (int)(1.2 * ms));
+						ms = min(ms, this->maxthreadnum);
+						resize(ms);
 					}
 					else {
 						startThread(outThread.front());
@@ -546,9 +575,10 @@ namespace ptpl {
 					//激活一个等待中的线程
 					unique_lock<mutex>lck(mx);
 					cv.notify_one();
-					return pck;
+					
 				}
 			}
+			return pck;
 		}
 	};
 }
