@@ -1,4 +1,13 @@
 #pragma once
+#ifdef _WIN32
+#include <windows.h>
+#define sleep(x) Sleep(x)
+#else
+#include <unistd.h>
+#define sleep(x) usleep(x * 1000)
+#endif
+
+
 #include <queue>
 #include <functional>
 #include <future>
@@ -457,7 +466,7 @@ namespace ptpl {
 		}
 	};
 	//支持自适应线程大小的线程池
-	class AutoSuitPool :public FCFS_ThreadPool {
+	class AutoSuitPool{
 	private:
 		queue<int>outThread;//已经退出的线程id
 		mutex outlock;
@@ -467,12 +476,64 @@ namespace ptpl {
 		//最大线程数量
 		int maxthreadnum = 100;
 		//超时时间
-		int maxwaittime = 5000;
+		int maxwaittime = 3;
 
-		//线程释放机制
+		//用来同步对任务队列访问的条件变量与互斥锁
+		mutex mx;
+		condition_variable cv;
+		//线程池
+		vector<unique_ptr<thread>>threadpool;
+		//线程停止信号
+		vector<shared_ptr<atomic<bool>>> stopsign;
+		//任务队列
+		TaskQueue tasks;
+		//空闲线程数量
+		atomic<int> idleThreadNum;
+		//线程池状态
+		atomic<bool>isDone;
+		atomic<bool>isStop;
+		//启动i号线程
+
+
+		//禁用拷贝构造函数
+		AutoSuitPool& operator=(const AutoSuitPool&);
+		AutoSuitPool& operator=(const AutoSuitPool&&);
+
+		//禁用赋值构造函数
+		AutoSuitPool(const AutoSuitPool&);
+		AutoSuitPool(const AutoSuitPool&&);
 		
+		void resize(int n) {
+			//运行状态下才能生效
+			if (!isStop && !isDone) {
+				int oldsize = threadpool.size();
+				if (n >= oldsize) {
+					threadpool.resize(n);
+					stopsign.resize(n);
+					for (int i = oldsize; i < n; i++) {
+
+						stopsign[i] = make_shared<atomic<bool>>(false);
+						startThread(i);
+					}
+				}
+				else {
+					for (int i = n; i < oldsize; i++) {
+						(*stopsign[i]) = true;
+						threadpool[i]->detach();
+					}
+					{
+						//激活所有线程，使所有释放的线程结束。
+						unique_lock<mutex>lck(mx);
+						cv.notify_all();
+					}
+					//安全的删除
+					threadpool.resize(n);
+					stopsign.resize(n);
+				}
+			}
+		}
 		//启动线程
-		void startThread(int i) {
+		void startThread(int i){
 			shared_ptr<atomic<bool>>stop_sign_copy(this->stopsign[i]);
 			//创建线程任务
 			auto threadtask = [this, i, stop_sign_copy]() {
@@ -481,14 +542,17 @@ namespace ptpl {
 				bool tasknoempty = this->tasks.pop(_func);
 				while (true) {
 					//取任务成功，执行任务
+					
 					while (tasknoempty) {
 						(*_func)();
 						//检查停止信号
-						if (_sign)return;
+						
+						if (_sign) { return; }
 						else tasknoempty = this->tasks.pop(_func);
 					}
 					//将线程加入到等待表
-					totable.push(i);
+					//cout << i << "号进程进入等待表" << endl;
+					this->totable.push(i);
 					//空闲线程+1
 					unique_lock<mutex>lck(this->mx);
 					++this->idleThreadNum;
@@ -500,27 +564,36 @@ namespace ptpl {
 					--this->idleThreadNum;
 					//已无任务执行，结束线程任务
 					if (!tasknoempty) {
+						//cout << i << "号进程结2束";
 						return;
 					}
 				}
 			};
 			//线程任务交付线程执行
 			//释放之前的线程
-			this->threadpool[i]->detach();
+			if (this->threadpool[i] != nullptr) this->threadpool[i]->detach();
+			*this->stopsign[i] = false;
 			this->threadpool[i].reset(new thread(threadtask));
 		}
+		//线程池标志量初始化
+		void init() {
+			isStop = false;
+			isDone = false;
+			idleThreadNum = 0;
+		}
 		//超时监控线程
-		void startThreadMaster() {
+		void startThreadManage() {
 			this->Threadmaster = new thread([this]() {
+				//cout << "监控线程开始执行" << endl;
 				long long t;
 				while (true) {
-					Sleep(this->maxwaittime);
+					sleep(this->maxwaittime*1000);
+					if (this->isStop || this->isDone)break;
 					time(&t);
 					int i;
 					this->totable.lockque();
 					if (!this->totable.empty()) {
-						
-						while (t - this->totable.GetTopTime() > this->maxwaittime) {
+						if (t - this->totable.GetTopTime() > this->maxwaittime) {
 							i = this->totable.pop();
 							if (i < 0)break;
 							//终止线程
@@ -534,8 +607,8 @@ namespace ptpl {
 							{
 								unique_lock<mutex> lck(this->outlock);
 								this->outThread.push(i);
+								//cout << "退出" << i << "线程" << endl;
 							}						
-							time(&t);
 						}
 						
 					}
@@ -545,13 +618,22 @@ namespace ptpl {
 		}
 	public:
 		//启动监控线程
-		AutoSuitPool():FCFS_ThreadPool(5) {
-			startThreadMaster();
+		AutoSuitPool() {
+			init();
+			startThreadManage();
 		}
-		AutoSuitPool(int maxThreadNum,int FirstThreadNum,int overTime) :FCFS_ThreadPool(FirstThreadNum) {
+		AutoSuitPool(int maxThreadNum,int FirstThreadNum,int overTime){
+			init();
 			this->maxthreadnum = maxThreadNum;
 			this->maxwaittime = overTime;
-			startThreadMaster();
+			resize(FirstThreadNum);
+			startThreadManage();
+		}
+		~AutoSuitPool() {
+			stop(true);
+		}
+		int GetidleThreadNumber() {
+			return this->idleThreadNum;
 		}
 		//线程重启机制
 		template <typename F, typename... PARAM>
@@ -579,6 +661,36 @@ namespace ptpl {
 				}
 			}
 			return pck;
+		}
+		int GetRunningThread() {
+			return threadpool.size() - outThread.size();
+		}
+		void stop(bool iswait = false) {
+			if (!iswait) {//强制停止，不继续处理任务队列的剩余任务
+				//已经停止的情况
+				if (isStop)return;
+				isStop = true;
+				for (auto& i : stopsign) {
+					(*i) = true;
+				}
+				tasks.clear();
+			}
+			else {
+				if (isStop || isDone)return;
+				isDone = true;
+			}
+			{
+				unique_lock<mutex>lck(mx);
+				cv.notify_all();
+			}
+			for (auto& i : threadpool) {
+				if (i->joinable()) {
+					i->join();
+				}
+			}
+			tasks.clear();
+			threadpool.clear();
+			stopsign.clear();
 		}
 	};
 }

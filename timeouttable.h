@@ -31,7 +31,7 @@ namespace tot {
 		int pop() {
 			//unique_lock<mutex>lck(mx);
 			if (timeoutque.empty())return -1;
-			auto& temp = timeoutque.back();
+			auto temp = timeoutque.back();
 			timeoutque.pop_back();
 			addr.erase(temp.id);
 			return temp.id;
@@ -39,7 +39,11 @@ namespace tot {
 		void remove(int id) {
 			unique_lock<mutex>lck(mx);
 			if (addr.count(id)) {
-				timeoutque.erase(addr[id]);
+				//timeoutque.erase(addr[id]);
+				for (auto i = timeoutque.begin(); i != timeoutque.end();) {
+					if (i->id == id)i = timeoutque.erase(i);
+					else i++;
+				}
 				addr.erase(id);
 			}
 		}
