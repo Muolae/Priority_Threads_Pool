@@ -8,21 +8,11 @@
 #include <atomic>
 using namespace std;
 //任务队列抽象类
-template<class C>
-class Task {
-protected:
-	C taskque;
 
+class TaskQueue {
+private:
 	mutex x;//任务队列互斥锁
-
-	template <typename F, typename... PARAM>
-	auto funcPackage(function<void(void)>*& _f,F&& f, PARAM&&... params) {
-		auto pck = make_shared<packaged_task<decltype(f(params...))(void)> >(
-			bind(forward<F>(f), forward<PARAM>(params)...)
-			);
-		 _f = new function<void(void)>([pck]() {(*pck)(); });
-		return pck->get_future();
-	}
+	queue<function<void(void)>*>taskque;
 public:
 	int size() {
 		unique_lock<mutex>lck(this->x);
@@ -33,16 +23,16 @@ public:
 		return taskque.empty();
 	}
 	bool pop(function<void(void)>*& t) {
+		unique_lock<mutex>lck(this->x);
 		if (taskque.empty())return false;
 		else {
-			unique_lock<mutex>lck(this->x);
 			t = taskque.front();
 			taskque.pop();
 			return true;
 		}
 		return false;
 	}
-	virtual void clear() {
+	void clear() {
 		//unique_lock<mutex>lck(this->x);
 		function<void(void)>* f;
 		while (pop(f)) {
@@ -52,19 +42,16 @@ public:
 	//把函数包装成可调用对象，加入到队列中
 	template <typename F, typename... PARAM>
 	auto push(F&& f, PARAM&&... params) {
-		function<void(void)>* _f;
-		auto pf=funcPackage(_f,f,params...);
+		auto pck = make_shared<packaged_task<decltype(f(params...))(void)> >(
+			bind(forward<F>(f), forward<PARAM>(params)...)
+			);
+		function<void(void)>* _f = new function<void(void)>([pck]() {(*pck)(); });
 		{
 			unique_lock<mutex>lck(x);
 			taskque.push(_f);
 		}
-		return pf;
+		return pck->get_future();
 	}
-
-
-};
-class FCFSTaskque :public Task<queue<function<void(void)>*>> {
-
 };
 
 //优先任务队列
@@ -79,9 +66,21 @@ public:
 		return a.priority < b.priority;
 	}
 };
-class PriorityTaskque:public Task<priority_queue<PriorityTask,vector<PriorityTask>,cmp> > {
+class PriorityTaskQueue {
+private:
+	mutex x;
+	priority_queue<PriorityTask, vector<PriorityTask>, cmp> taskque;
 public:
-	bool pop(function<void(void)>*& t){
+	int size() {
+		unique_lock<mutex>lck(this->x);
+		return (int)taskque.size();
+	}
+	bool empty() {
+		unique_lock<mutex>lck(this->x);
+		return taskque.empty();
+	}
+	bool pop(function<void(void)>*& t) {
+
 		if (taskque.empty())return false;
 		else {
 			unique_lock<mutex>lck(this->x);
@@ -94,58 +93,79 @@ public:
 	void clear() {
 		//unique_lock<mutex>lck(this->x);
 		function<void(void)>* f;
-		while (this->pop(f)) {
+		while (pop(f)) {
 			delete f;
 		}
 	}
 	template <typename F, typename... PARAM>
-	auto push(int pri,F&& f, PARAM&&... params) {
-		function<void(void)>* _f;
-		auto pf = funcPackage(_f, f, params...);
+	auto push(int priority, F&& f, PARAM&&... params) {
+		auto pck = make_shared<packaged_task<decltype(f(params...))(void)> >(
+			bind(forward<F>(f), forward<PARAM>(params)...)
+			);
+		function<void(void)>* _f = new function<void(void)>([pck]() {(*pck)(); });
 		{
 			unique_lock<mutex>lck(x);
-			taskque.push(PriorityTask(pri,_f));
+			taskque.push(PriorityTask(priority, _f));
 		}
-		return pf;
+		return pck->get_future();
 	}
 };
-//定义抽象模板类
-class Threadpool {
+
+class FCFS_ThreadPool {
 protected:
-	//线程互斥锁
+	//禁用拷贝构造函数
+	FCFS_ThreadPool& operator=(const FCFS_ThreadPool&);
+	FCFS_ThreadPool& operator=(const FCFS_ThreadPool&&);
+
+	//禁用赋值构造函数
+	FCFS_ThreadPool(const FCFS_ThreadPool&);
+	FCFS_ThreadPool(const FCFS_ThreadPool&&);
+
+	//用来同步对任务队列访问的条件变量与互斥锁
 	mutex mx;
 	condition_variable cv;
 	//线程池
 	vector<unique_ptr<thread>>threadpool;
 	//线程停止信号
 	vector<shared_ptr<atomic<bool>>> stopsign;
+	//任务队列
+	TaskQueue tasks;
 	//空闲线程数量
 	atomic<int> idleThreadNum;
 	//线程池状态
 	atomic<bool>isDone;
 	atomic<bool>isStop;
+	//虚函数访问接口
+	virtual bool queuePop(function<void(void)>*& f){
+		return tasks.pop(f);
+	}
+	virtual int queueSize() {
+		return tasks.size();
+	}
+	virtual void queueClear() {
+		return tasks.clear();
+	}
 	//启动i号线程
-	template <class C>
-	void startThread(int i,C& tasks) {
+	void startThread(int i) {
 		shared_ptr<atomic<bool>>stop_sign_copy(this->stopsign[i]);
 		//创建线程任务
 		auto threadtask = [this, i, stop_sign_copy]() {
 			atomic<bool>& _sign = *stop_sign_copy;
 			function<void(void)>* _func;
-			bool tasknoempty = tasks.pop(_func);
+			bool tasknoempty = this->queuePop(_func);
 			while (true) {
 				//取任务成功，执行任务
 				while (tasknoempty) {
 					(*_func)();
 					//检查停止信号
 					if (_sign)return;
-					else tasknoempty = tasks.pop(_func);
+					else tasknoempty = this->queuePop(_func);
 				}
 				//空闲线程+1
 				unique_lock<mutex>lck(this->mx);
 				++this->idleThreadNum;
 				this->cv.wait(lck, [this, &_func, &_sign, &tasknoempty]() {
-					tasknoempty = tasks.pop(_func);
+					tasknoempty = this->queuePop(_func);
 					return tasknoempty || this->isDone || _sign;
 					});
 				--this->idleThreadNum;
@@ -164,9 +184,25 @@ protected:
 		isDone = false;
 		idleThreadNum = 0;
 	}
+public:
+
+	//构造函数
+	FCFS_ThreadPool() {
+		init();
+	}
+	FCFS_ThreadPool(int n) {
+		resize(n);
+		init();
+	}
+	//析构函数
+	~FCFS_ThreadPool() {
+
+
+		stop(true);
+
+	}
 	//设置线程池大小并且启动线程
-	template<class C>
-	void resize(int n,C& tasks) {
+	void resize(int n) {
 		//运行状态下才能生效
 		if (!isStop && !isDone) {
 			int oldsize = threadpool.size();
@@ -176,7 +212,7 @@ protected:
 				for (int i = oldsize; i < n; i++) {
 
 					stopsign[i] = make_shared<atomic<bool>>(false);
-					startThread<C>(i,&tasks);
+					startThread(i);
 				}
 			}
 			else {
@@ -204,18 +240,15 @@ protected:
 		return threadpool.size();
 	}
 	//获取剩余任务数量
-	template<class C>
-	int GetTaskQueueSize(C& tasks) {
-		return tasks.size();
+	int GetTaskQueueSize() {
+		return queueSize();
 	}
 	//清空任务队列
-	template<class C>
-	void clear_allTask(C&tasks) {
-		tasks.clear();
+	void clear_allTask() {
+		queueClear();
 	}
 	//停止线程池
-	template<class C>
-	void stop(C&tasks,bool iswait = false) {
+	void stop(bool iswait = false) {
 		if (!iswait) {//强制停止，不继续处理任务队列的剩余任务
 			//已经停止的情况
 			if (isStop)return;
@@ -223,8 +256,7 @@ protected:
 			for (auto& i : stopsign) {
 				(*i) = true;
 			}
-			tasks.clear();
-
+			queueClear();
 		}
 		else {
 			if (isStop || isDone)return;
@@ -237,23 +269,59 @@ protected:
 
 		for (auto& i : threadpool) {
 			if (i->joinable()) {
-
 				i->join();
-
 			}
 		}
 
-		tasks.clear();
+		queueClear();
 		threadpool.clear();
 		stopsign.clear();
 
 	}
-	template <class C,typename F, typename... PARAM>
-	auto push(C&tasks,F&& f, PARAM&&... params) {
+	template <typename F, typename... PARAM>
+	auto push(F&& f, PARAM&&... params) {
 		auto pck = tasks.push(forward<F>(f), forward<PARAM>(params)...);
 		//激活一个等待中的线程
 		unique_lock<mutex>lck(mx);
 		cv.notify_one();
 		return pck;
+	}
+};
+
+//任务优先队列
+class PriorityThreadPool :public FCFS_ThreadPool {
+public:
+	//构造函数
+	PriorityThreadPool() :FCFS_ThreadPool() {};
+	PriorityThreadPool(int n) :FCFS_ThreadPool(n) {};
+	//析构函数
+	~PriorityThreadPool(){
+		stop(true);
+	}
+	template <typename F, typename... PARAM>
+	auto push(int priority, F&& f, PARAM&&... params) {
+		auto pck = tasks.push(priority, forward<F>(f), forward<PARAM>(params)...);
+		//激活一个等待中的线程
+		unique_lock<mutex>lck(mx);
+		cv.notify_one();
+		return pck;
+	}
+private:
+	//禁用拷贝构造函数
+	PriorityThreadPool& operator=(const PriorityThreadPool&);
+	PriorityThreadPool& operator=(const PriorityThreadPool&&);
+	//禁用赋值构造函数
+	PriorityThreadPool(const PriorityThreadPool&);
+	PriorityThreadPool(const PriorityThreadPool&&);
+	PriorityTaskQueue tasks;
+	//虚函数重写
+	virtual bool queuePop(function<void(void)>*& f)override{
+		return tasks.pop(f);
+	}
+	virtual int queueSize()override{
+		return tasks.size();
+	}
+	virtual void queueClear()override{
+		return tasks.clear();
 	}
 };

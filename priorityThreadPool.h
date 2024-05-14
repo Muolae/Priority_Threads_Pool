@@ -465,6 +465,7 @@ namespace ptpl {
 			return pck;
 		}
 	};
+
 	//支持自适应线程大小的线程池
 	class AutoSuitPool{
 	private:
